@@ -5,10 +5,11 @@ production cellar. It keeps formula approval, vessel availability, active
 fermentation runs, gravity observations, conditioning, completion metrics, and
 vessel cleaning in one deterministic process.
 
-This repository is a healthy initialization baseline. It has no intentional
-defects and no automated test suite. Tests are intentionally deferred to a
-later engineering task; the production workflow checks in this repository
-remain available for immediate build and behavior verification.
+This repository started as a healthy initialization baseline. It has no
+intentional defects. Focused regression tests now cover revision publication
+and recovery; broader systematic tests are still deferred to a later
+engineering task. The production workflow checks in this repository remain
+available for immediate build and behavior verification.
 
 ## Requirements
 
@@ -131,7 +132,10 @@ after that operation succeeds.
 
 On startup, an existing snapshot is decoded and normalized. Unknown or
 conflicting map indexes are not silently invented; invalid JSON or a negative
-revision stops the process before HTTP serving begins.
+revision stops the process before HTTP serving begins. The health revision is
+the last snapshot commit that was fully persisted and published. Rejected or
+unfinished writes leave it unchanged, while successful writes increment it by
+one and retain that exact value after restart.
 
 ## Repair-Ready Boundaries
 

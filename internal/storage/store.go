@@ -63,7 +63,12 @@ func normalizeSnapshot(value domain.Snapshot) (domain.Snapshot, error) {
 	if value.RevisionFence.CommittedRevision < 0 {
 		return domain.Snapshot{}, fmt.Errorf("state committed revision cannot be negative")
 	}
-	value.RevisionFence.Recover(value.Revision)
+	durableRevision := value.Revision
+	if value.RevisionFence.CommittedRevision > durableRevision {
+		durableRevision = value.RevisionFence.CommittedRevision
+	}
+	value.RevisionFence.Recover(durableRevision)
+	value.Revision = value.RevisionFence.CommittedRevision
 	if value.Formulas == nil {
 		value.Formulas = map[string]domain.Formula{}
 	}
@@ -141,7 +146,7 @@ func compareIndexes(label string, actual, expected map[string]string) error {
 func (s *Store) Revision() int64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.snapshot.RevisionFence.EffectiveRevision()
+	return s.snapshot.Revision
 }
 
 func (s *Store) RevisionStatus() domain.RevisionStatus {
@@ -166,16 +171,15 @@ func (s *Store) Update(expected *int64, mutate func(*domain.Snapshot) error) err
 			"the supplied revision does not match the current snapshot")
 	}
 	candidate := s.snapshot.Clone()
-	attemptedRevision := candidate.RevisionFence.AdmitAttempt(s.snapshot.Revision)
 	if err := mutate(&candidate); err != nil {
-		s.snapshot.RevisionFence = candidate.RevisionFence
 		return err
 	}
-	candidate.Revision = attemptedRevision
+
+	nextRevision := candidate.Revision + 1
+	candidate.Revision = nextRevision
+	candidate.RevisionFence.Commit(nextRevision)
 	candidate.UpdatedAt = s.now()
-	candidate.RevisionFence.CommitAttempt(attemptedRevision)
 	if err := writeSnapshot(s.path, candidate); err != nil {
-		s.snapshot.RevisionFence = candidate.RevisionFence
 		return domain.NewError(domain.CodeStorage, err.Error())
 	}
 	s.snapshot = candidate

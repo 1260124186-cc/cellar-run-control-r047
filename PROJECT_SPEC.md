@@ -194,9 +194,13 @@ rejects a stale write instead of overwriting newer state.
 ## Persistence And Concurrency
 
 The configured data directory contains `state.json`. Writes are serialized by
-an in-process mutex. The complete state is encoded, committed to durable
-storage, and then atomically renamed over the target. An update is not
-published in memory unless persistence succeeds.
+an in-process mutex. A request is validated on a copied snapshot. The complete
+state is then assigned the next revision, encoded, committed to durable
+storage, and atomically renamed over the target; the directory entry is synced
+after replacement. A revision and its updated state are not published in
+memory unless persistence succeeds. Rejected or unfinished writes therefore do
+not consume a revision. The durable revision is the high-water mark on restart
+and successful writes advance it by exactly one without gaps.
 
 Reads use copied values and never expose repository-owned maps or slices. The
 default address is `127.0.0.1:8088`, the request body limit is 1 MiB, and all
@@ -204,11 +208,9 @@ workflow checks use temporary directories.
 
 ## Validation Plan
 
-The baseline declares `testing: deferred` and intentionally contains no unit
-tests, fixtures, integration tests, or browser E2E files. A later verification
-task owns systematic tests for validation boundaries, state transitions,
-numeric calculations, stale revisions, storage failures, and concurrent
-reservation attempts.
+The baseline originally declared `testing: deferred`. It now contains focused
+revision regression tests; systematic tests for the remaining behavior
+surfaces are still deferred to a later engineering task.
 
 The current build command is `go build ./...`. Three bounded production checks
 start the real HTTP handler, issue real JSON requests, check success and failure

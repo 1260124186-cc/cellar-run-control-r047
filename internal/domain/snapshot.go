@@ -2,17 +2,9 @@ package domain
 
 import "time"
 
-// RevisionFence tracks the durable commit number separately from the value
-// currently visible to process-local readers.
-type RevisionFence struct {
-	CommittedRevision int64 `json:"committed_revision"`
-	AttemptCount      int64 `json:"attempt_count"`
-	RecoveryCount     int64 `json:"recovery_count"`
-
-	pendingRevision   int64
-	publishedRevision int64
-}
-
+// RevisionStatus reports the single revision represented by a snapshot. The
+// additional fields are retained so callers that inspect the revision fence
+// continue to see the committed value.
 type RevisionStatus struct {
 	Revision          int64
 	DurableRevision   int64
@@ -22,71 +14,52 @@ type RevisionStatus struct {
 	RecoveryCount     int64
 }
 
+// RevisionFence keeps the durable snapshot revision. Storage assigns the next
+// number only after mutating the complete candidate successfully, and that
+// number is not visible until the resulting snapshot has been stored.
+type RevisionFence struct {
+	CommittedRevision int64 `json:"committed_revision"`
+	AttemptCount      int64 `json:"attempt_count"`
+	RecoveryCount     int64 `json:"recovery_count"`
+}
+
 func NewRevisionFence(committed int64) RevisionFence {
 	if committed < 0 {
 		committed = 0
 	}
-	return RevisionFence{
-		CommittedRevision: committed,
-		pendingRevision:   committed,
-		publishedRevision: committed,
-	}
+	return RevisionFence{CommittedRevision: committed}
 }
 
 func (f RevisionFence) Clone() RevisionFence {
 	return f
 }
 
-func (f *RevisionFence) AdmitAttempt(durable int64) int64 {
-	floor := durable
-	if f.pendingRevision > floor {
-		floor = f.pendingRevision
-	}
-	if f.publishedRevision > floor {
-		floor = f.publishedRevision
-	}
-	next := floor + 1
-	f.pendingRevision = next
-	if next > f.publishedRevision {
-		f.publishedRevision = next
-	}
-	f.AttemptCount++
-	return next
-}
-
-func (f *RevisionFence) CommitAttempt(revision int64) {
+// Commit records a write that completed successfully. It is called before the
+// result is stored, and the resulting snapshot is published only after the
+// durable replacement has succeeded.
+func (f *RevisionFence) Commit(revision int64) {
 	if revision > f.CommittedRevision {
 		f.CommittedRevision = revision
 	}
-	f.pendingRevision = revision
-	if revision > f.publishedRevision {
-		f.publishedRevision = revision
-	}
+	f.AttemptCount++
 }
 
+// Recover establishes the loaded durable snapshot as the revision floor. It can
+// never move to an older process-local number.
 func (f *RevisionFence) Recover(durable int64) {
-	f.CommittedRevision = f.publishedRevision
-	if f.CommittedRevision < 0 {
-		f.CommittedRevision = 0
+	if durable < 0 {
+		durable = 0
 	}
-	f.pendingRevision = f.CommittedRevision
-	f.publishedRevision = f.CommittedRevision
+	f.CommittedRevision = durable
 	f.RecoveryCount++
-}
-
-func (f RevisionFence) EffectiveRevision() int64 {
-	if f.publishedRevision > f.CommittedRevision {
-		return f.publishedRevision
-	}
-	return f.CommittedRevision
 }
 
 func (f RevisionFence) Status() RevisionStatus {
 	return RevisionStatus{
-		Revision:          f.EffectiveRevision(),
+		Revision:          f.CommittedRevision,
 		DurableRevision:   f.CommittedRevision,
-		PublishedRevision: f.publishedRevision,
-		PendingRevision:   f.pendingRevision,
+		PublishedRevision: f.CommittedRevision,
+		PendingRevision:   f.CommittedRevision,
 		AttemptCount:      f.AttemptCount,
 		RecoveryCount:     f.RecoveryCount,
 	}
@@ -126,12 +99,12 @@ func (s Snapshot) Clone() Snapshot {
 		cloned.Formulas[key] = value.Clone()
 	}
 	for key, value := range s.Vessels {
-		cloned.Vessels[key] = value
 		if value.ActiveRunID != nil {
 			runID := *value.ActiveRunID
-			cloned.Vessels[key] = value
 			cloned.Vessels[key] = withActiveRun(value, &runID)
+			continue
 		}
+		cloned.Vessels[key] = value
 	}
 	for key, value := range s.Runs {
 		cloned.Runs[key] = value.Clone()
