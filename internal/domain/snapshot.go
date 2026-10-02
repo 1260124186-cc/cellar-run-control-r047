@@ -2,15 +2,19 @@ package domain
 
 import "time"
 
-// RevisionFence tracks the durable commit number separately from the value
-// currently visible to process-local readers.
+// RevisionFence keeps the durable commit number authoritative while
+// holding a process-local high-water mark. A revision is reserved only
+// for a write that has fully completed, and once a value has been
+// published it can never move backwards within the process.
 type RevisionFence struct {
 	CommittedRevision int64 `json:"committed_revision"`
 	AttemptCount      int64 `json:"attempt_count"`
 	RecoveryCount     int64 `json:"recovery_count"`
 
-	pendingRevision   int64
-	publishedRevision int64
+	// highWater is process-local state (never serialized). It records the
+	// largest revision this process has held, so an in-memory state can
+	// never fall behind a revision that was already published.
+	highWater int64
 }
 
 type RevisionStatus struct {
@@ -28,8 +32,7 @@ func NewRevisionFence(committed int64) RevisionFence {
 	}
 	return RevisionFence{
 		CommittedRevision: committed,
-		pendingRevision:   committed,
-		publishedRevision: committed,
+		highWater:         committed,
 	}
 }
 
@@ -37,56 +40,69 @@ func (f RevisionFence) Clone() RevisionFence {
 	return f
 }
 
-func (f *RevisionFence) AdmitAttempt(durable int64) int64 {
-	floor := durable
-	if f.pendingRevision > floor {
-		floor = f.pendingRevision
+// Reserve returns the revision a new successful write would use without
+// publishing it. A rejected or unfinished write must not keep this value,
+// so the fence itself is left untouched; reservation only advances the
+// durable, monotonically increasing commit number.
+func (f *RevisionFence) Reserve(durable int64) int64 {
+	if durable < f.CommittedRevision {
+		durable = f.CommittedRevision
 	}
-	if f.publishedRevision > floor {
-		floor = f.publishedRevision
+	if durable < 0 {
+		durable = 0
 	}
-	next := floor + 1
-	f.pendingRevision = next
-	if next > f.publishedRevision {
-		f.publishedRevision = next
+	return durable + 1
+}
+
+// Commit publishes a revision only after its snapshot has been persisted
+// durably. The high-water mark advances together with the durable value,
+// making the new fact immediately visible to concurrent readers.
+func (f *RevisionFence) Commit(revision int64) {
+	if revision <= f.CommittedRevision {
+		return
 	}
+	f.CommittedRevision = revision
 	f.AttemptCount++
-	return next
-}
-
-func (f *RevisionFence) CommitAttempt(revision int64) {
-	if revision > f.CommittedRevision {
-		f.CommittedRevision = revision
-	}
-	f.pendingRevision = revision
-	if revision > f.publishedRevision {
-		f.publishedRevision = revision
+	if revision > f.highWater {
+		f.highWater = revision
 	}
 }
 
+// Recover reconciles process-local state with the durable value loaded
+// from disk. The durable high-water mark is the largest revision that
+// may already have been observed by clients, so it is preserved and
+// never reset to an earlier value.
 func (f *RevisionFence) Recover(durable int64) {
-	f.CommittedRevision = f.publishedRevision
-	if f.CommittedRevision < 0 {
-		f.CommittedRevision = 0
+	if durable < f.CommittedRevision {
+		durable = f.CommittedRevision
 	}
-	f.pendingRevision = f.CommittedRevision
-	f.publishedRevision = f.CommittedRevision
+	if durable < f.highWater {
+		durable = f.highWater
+	}
+	if durable < 0 {
+		durable = 0
+	}
+	f.CommittedRevision = durable
+	f.highWater = durable
 	f.RecoveryCount++
 }
 
+// EffectiveRevision is the single continuous fact visible to readers: the
+// revision of the last completely persisted, successful commit.
 func (f RevisionFence) EffectiveRevision() int64 {
-	if f.publishedRevision > f.CommittedRevision {
-		return f.publishedRevision
+	if f.highWater > f.CommittedRevision {
+		return f.highWater
 	}
 	return f.CommittedRevision
 }
 
 func (f RevisionFence) Status() RevisionStatus {
+	revision := f.EffectiveRevision()
 	return RevisionStatus{
-		Revision:          f.EffectiveRevision(),
+		Revision:          revision,
 		DurableRevision:   f.CommittedRevision,
-		PublishedRevision: f.publishedRevision,
-		PendingRevision:   f.pendingRevision,
+		PublishedRevision: revision,
+		PendingRevision:   0,
 		AttemptCount:      f.AttemptCount,
 		RecoveryCount:     f.RecoveryCount,
 	}
